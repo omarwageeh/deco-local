@@ -27,8 +27,8 @@ describe('DecoClient against mock Deco', () => {
     const r = await c.request('admin/device?form=device_list');
     assert.equal(c.baseUrl, `http://${host}`);
     assert.equal(r.device_list.length, 3);
-    assert.ok(c.stok);
-    assert.match(c.cookie, /^sysauth=/);
+    assert.ok(c.session.stok);
+    assert.match(c.session.cookie, /^sysauth=/);
   });
 
   test('wrong password is reported as -5002', async () => {
@@ -39,11 +39,46 @@ describe('DecoClient against mock Deco', () => {
   test('re-logs in transparently when the session expires', async () => {
     const c = new DecoClient({ host, password: 'p@ss wörd+1' });
     await c.login();
-    const firstStok = c.stok;
-    await new Promise((r) => http.get(`http://${host}/__mock/expire`, r));
+    const firstStok = c.session.stok;
+    await expire(host);
     const r = await c.request('admin/client?form=client_list', 'read', { device_mac: 'default' });
     assert.equal(r.client_list.length, 6);
-    assert.notEqual(c.stok, firstStok);
+    assert.notEqual(c.session.stok, firstStok);
+  });
+
+  test('parallel requests that all hit an expired session share one re-login', async () => {
+    const c = new DecoClient({ host, password: 'p@ss wörd+1' });
+    await c.login();
+    await expire(host);
+    const logins = () => mock.requests.filter((p) => p === 'login?form=login').length;
+    const before = logins();
+    const results = await Promise.all([
+      c.request('admin/device?form=device_list'),
+      c.request('admin/network?form=performance'),
+      c.request('admin/wireless?form=wlan'),
+      c.request('admin/network?form=internet'),
+    ]);
+    assert.equal(results[0].device_list.length, 3);
+    assert.equal(logins() - before, 1);
+  });
+
+  test('reads are cached only when asked, and writes clear the cache', async () => {
+    const c = new DecoClient({ host, password: 'p@ss wörd+1' });
+    const count = () => mock.requests.filter((p) => p === 'admin/device?form=device_list').length;
+    const opts = { cacheMs: 5000 };
+    await c.request('admin/device?form=device_list', 'read', undefined, opts);
+    const before = count();
+    await Promise.all([
+      c.request('admin/device?form=device_list', 'read', undefined, opts),
+      c.request('admin/device?form=device_list', 'read', undefined, opts),
+    ]);
+    assert.equal(count(), before, 'served from cache');
+    await c.request('admin/device?form=device_list');
+    await c.request('admin/device?form=device_list');
+    assert.equal(count(), before + 2, 'no cacheMs means always fresh');
+    await c.request('admin/network?form=igmp_setting', 'write', { enable_join_igmpv3: false });
+    await c.request('admin/device?form=device_list', 'read', undefined, opts);
+    assert.equal(count(), before + 3, 'a write clears the cache');
   });
 
   test('concurrent requests share one login', async () => {
@@ -66,6 +101,60 @@ describe('DecoClient against mock Deco', () => {
   test('unreachable host gives a helpful error', async () => {
     const c = new DecoClient({ host: '127.0.0.1:1', password: 'x', timeoutMs: 2000 });
     await assert.rejects(c.login(), /Could not reach a Deco/);
+  });
+});
+
+describe('performance against a slow Deco', () => {
+  const DELAY = 250;
+  let mock;
+  let host;
+  before(async () => {
+    mock = createMockDeco({ password: 'decopass', delayMs: DELAY });
+    host = `127.0.0.1:${await mock.listen()}`;
+  });
+  after(() => mock.close());
+
+  test('requests run in parallel instead of queueing', async () => {
+    const c = new DecoClient({ host, password: 'decopass', timeoutMs: 5000 });
+    await c.login();
+    const t = Date.now();
+    await Promise.all([
+      c.request('admin/device?form=device_list'),
+      c.request('admin/network?form=performance'),
+      c.request('admin/network?form=internet'),
+      c.request('admin/network?form=wan_ipv4'),
+      c.request('admin/wireless?form=wlan'),
+      c.request('admin/device?form=timesetting'),
+    ]);
+    const ms = Date.now() - t;
+    // Sequential would be 6 x 250 ms = 1500 ms.
+    assert.ok(ms < DELAY * 3, `6 requests took ${ms} ms`);
+  });
+
+  test('overview API is about one round trip, not six', async () => {
+    const app = createServer();
+    await new Promise((r) => app.listen(0, '127.0.0.1', r));
+    const base = `http://127.0.0.1:${app.address().port}`;
+    try {
+      const login = await fetch(base + '/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Deco-Local': '1' },
+        body: JSON.stringify({ host, password: 'decopass' }),
+      });
+      const cookie = login.headers.get('set-cookie').split(';')[0];
+      const t = Date.now();
+      const res = await fetch(base + '/api/overview', { headers: { Cookie: cookie } });
+      assert.equal(res.status, 200);
+      const ms = Date.now() - t;
+      assert.ok(ms < DELAY * 3, `overview took ${ms} ms`);
+      // Switching to the Decos tab right after reuses the cached list.
+      const t2 = Date.now();
+      await fetch(base + '/api/decos', { headers: { Cookie: cookie } });
+      assert.ok(Date.now() - t2 < DELAY, 'decos served from cache');
+    } finally {
+      app.closeAllConnections?.();
+      await new Promise((r) => app.close(r));
+    }
   });
 });
 
@@ -105,6 +194,7 @@ describe('Deco Local HTTP API end to end', () => {
   });
   after(async () => {
     await mock.close();
+    app.closeAllConnections?.();
     await new Promise((r) => app.close(r));
     fs.rmSync(process.env.DECO_LOCAL_CONFIG, { force: true });
   });
@@ -259,6 +349,10 @@ describe('Deco Local HTTP API end to end', () => {
     assert.equal(mock.session, null, 'Deco session was logged out too');
   });
 });
+
+function expire(host) {
+  return new Promise((r) => http.get(`http://${host}/__mock/expire`, (res) => res.resume().on('end', r)));
+}
 
 function b64ToRaw(s) {
   return Buffer.from(s, 'utf8').toString('base64');

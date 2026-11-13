@@ -13,12 +13,14 @@
 //               RSA_PKCS1(  "h=<md5('admin'+pwd)>&s=<seq+len(data)>"  )                otherwise
 //      and responses are `{"data": AES(JSON)}`.
 //   5. Login returns `stok` (goes into the URL) and a `sysauth` cookie.
+//
+// Performance: the Deco answers every request with `Connection: close`, so each
+// request needs a new TLS connection. We resume TLS sessions (much cheaper than a
+// full handshake on the Deco's CPU) and send requests in parallel, as the web UI does.
 
 const crypto = require('node:crypto');
 const http = require('node:http');
 const https = require('node:https');
-
-const UNENCRYPTED_PATHS = new Set(['/login?form=keys', '/login?form=auth']);
 
 const ERROR_MESSAGES = {
   '-5002': 'Wrong password.',
@@ -26,6 +28,15 @@ const ERROR_MESSAGES = {
   '-5007': 'Too many failed login attempts. The Deco has locked login.',
   '-5001': 'Another admin session took over (web UI or another copy of this app).',
   timeout: 'Session expired.',
+};
+
+const SLOW_REQUEST_MS = 1500;
+const DEBUG = !!process.env.DECO_DEBUG;
+
+// Browsers allow 6 connections per host; the Deco's web UI is built for that.
+const agents = {
+  'https:': new https.Agent({ maxSockets: 6, maxCachedSessions: 16 }),
+  'http:': new http.Agent({ maxSockets: 6 }),
 };
 
 class DecoError extends Error {
@@ -78,13 +89,13 @@ function randomDigits(n) {
 
 function httpPost(url, { headers = {}, body = '', timeoutMs = 15000 } = {}) {
   const u = new URL(url);
-  const isHttps = u.protocol === 'https:';
-  const lib = isHttps ? https : http;
+  const lib = u.protocol === 'https:' ? https : http;
   return new Promise((resolve, reject) => {
     const req = lib.request(
       u,
       {
         method: 'POST',
+        agent: agents[u.protocol],
         // Decos use a self-signed certificate.
         rejectUnauthorized: false,
         headers: { 'Content-Length': Buffer.byteLength(body), ...headers },
@@ -117,23 +128,15 @@ class DecoClient {
     this.timeoutMs = timeoutMs;
     this.hash = crypto.createHash('md5').update('admin' + password).digest('hex');
     this.baseUrl = /^https?:\/\//i.test(this.host) ? this.host : null;
-    this._queue = Promise.resolve();
-    this._reset();
+    // The current login. Replaced as a whole on re-login, so requests that are
+    // already in flight keep using the keys they were encrypted with.
+    this.session = null;
+    this._loginPromise = null;
+    this._cache = new Map(); // key -> { expires, promise }
   }
 
-  _reset() {
-    this.stok = '';
-    this.cookie = '';
-    this.seq = null;
-    this.signKey = null;
-    this.pwdKey = null;
-    this.aesKey = randomDigits(16);
-    this.aesIv = randomDigits(16);
-    this.loggedIn = false;
-  }
-
-  _url(path) {
-    return `${this.baseUrl}/cgi-bin/luci/;stok=${this.stok}${path}`;
+  get loggedIn() {
+    return !!this.session;
   }
 
   // Newer firmware redirects http -> https; older firmware may only speak http.
@@ -160,7 +163,7 @@ class DecoClient {
   }
 
   async _plainPost(path, payload) {
-    const res = await httpPost(this._url(path), {
+    const res = await httpPost(`${this.baseUrl}/cgi-bin/luci/;stok=${path}`, {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       timeoutMs: this.timeoutMs,
@@ -175,22 +178,29 @@ class DecoClient {
     return json.result;
   }
 
-  async _encryptedPost(path, payload, { isLogin = false } = {}) {
-    const data = aesEncrypt(JSON.stringify(payload), this.aesKey, this.aesIv);
-    const signText =
-      (isLogin ? `k=${this.aesKey}&i=${this.aesIv}&` : '') + `h=${this.hash}&s=${this.seq + data.length}`;
-    const sign = rsaEncrypt(signText, this.signKey[0], this.signKey[1]);
+  async _encryptedPost(s, path, payload, { isLogin = false } = {}) {
+    const started = Date.now();
+    const data = aesEncrypt(JSON.stringify(payload), s.aesKey, s.aesIv);
+    const signText = (isLogin ? `k=${s.aesKey}&i=${s.aesIv}&` : '') + `h=${this.hash}&s=${s.seq + data.length}`;
+    const sign = rsaEncrypt(signText, s.signKey[0], s.signKey[1]);
     // The web UI posts form-encoded data while labelling it application/json; mirror that exactly.
     const body = `sign=${sign}&data=${encodeURIComponent(data)}`;
     const headers = { 'Content-Type': 'application/json' };
-    if (this.cookie) headers.Cookie = this.cookie;
+    if (s.cookie) headers.Cookie = s.cookie;
 
-    const res = await httpPost(this._url(path), { headers, body, timeoutMs: this.timeoutMs });
+    const res = await httpPost(`${this.baseUrl}/cgi-bin/luci/;stok=${s.stok}${path}`, {
+      headers,
+      body,
+      timeoutMs: this.timeoutMs,
+    });
+
+    const ms = Date.now() - started;
+    if (DEBUG || ms > SLOW_REQUEST_MS) console.log(`[deco] ${payload.operation} ${path} took ${ms} ms`);
 
     const setCookie = res.headers['set-cookie'];
     if (setCookie) {
       const auth = setCookie.map((c) => c.split(';')[0]).find((c) => c.startsWith('sysauth='));
-      if (auth) this.cookie = auth;
+      if (auth) s.cookie = auth;
     }
 
     if (res.status === 401 || res.status === 403) throw errorFor('timeout');
@@ -202,7 +212,7 @@ class DecoClient {
     }
     if (typeof json.data === 'string') {
       try {
-        json = JSON.parse(aesDecrypt(json.data, this.aesKey, this.aesIv));
+        json = JSON.parse(aesDecrypt(json.data, s.aesKey, s.aesIv));
       } catch {
         throw errorFor('timeout');
       }
@@ -214,33 +224,63 @@ class DecoClient {
     return json.result ?? json.data ?? {};
   }
 
-  async login() {
-    this._reset();
-    await this._resolveBaseUrl();
-    const keys = await this._plainPost('/login?form=keys', { operation: 'read' });
-    this.pwdKey = keys.password;
-    const auth = await this._plainPost('/login?form=auth', { operation: 'read' });
-    this.signKey = auth.key;
-    this.seq = parseInt(auth.seq, 10);
+  // Concurrent callers share one login attempt.
+  login() {
+    if (!this._loginPromise) {
+      this._loginPromise = this._login().finally(() => {
+        this._loginPromise = null;
+      });
+    }
+    return this._loginPromise;
+  }
 
-    const encryptedPassword = rsaEncrypt(this.password, this.pwdKey[0], this.pwdKey[1]);
+  async _login() {
+    this.session = null;
+    this._cache.clear();
+    await this._resolveBaseUrl();
+    const [keys, auth] = await Promise.all([
+      this._plainPost('/login?form=keys', { operation: 'read' }),
+      this._plainPost('/login?form=auth', { operation: 'read' }),
+    ]);
+    const s = {
+      stok: '',
+      cookie: '',
+      seq: parseInt(auth.seq, 10),
+      signKey: auth.key,
+      aesKey: randomDigits(16),
+      aesIv: randomDigits(16),
+    };
+    const encryptedPassword = rsaEncrypt(this.password, keys.password[0], keys.password[1]);
     const result = await this._encryptedPost(
+      s,
       '/login?form=login',
       { operation: 'login', params: { password: encryptedPassword } },
       { isLogin: true }
     );
     if (!result.stok) throw new DecoError('Login succeeded but the Deco returned no session token.');
-    this.stok = result.stok;
-    this.loggedIn = true;
+    s.stok = result.stok;
+    this.session = s;
     return result;
   }
 
   // Call any admin endpoint, e.g. request('admin/device?form=device_list', 'read').
-  // Requests are serialized so a re-login can't race with other requests.
-  request(path, operation = 'read', params) {
-    const run = this._queue.then(() => this._request(path, operation, params));
-    this._queue = run.catch(() => {});
-    return run;
+  // Reads can pass `cacheMs` to reuse a recent (or in-flight) identical read.
+  request(path, operation = 'read', params, { cacheMs = 0 } = {}) {
+    if (operation !== 'read') {
+      this._cache.clear();
+      return this._request(path, operation, params);
+    }
+    const key = path + '\n' + JSON.stringify(params ?? null);
+    const hit = this._cache.get(key);
+    if (cacheMs && hit && hit.expires > Date.now()) return hit.promise;
+    const promise = this._request(path, operation, params);
+    const entry = { expires: Infinity, promise };
+    this._cache.set(key, entry);
+    promise.then(
+      () => (entry.expires = Date.now() + cacheMs),
+      () => this._cache.get(key) === entry && this._cache.delete(key)
+    );
+    return promise;
   }
 
   // Re-logs in once if the session expired or was taken over.
@@ -248,26 +288,30 @@ class DecoClient {
     const p = '/' + path.replace(/^\/+/, '');
     const payload = { operation };
     if (params !== undefined) payload.params = params;
-    if (!this.loggedIn) await this.login();
+    if (!this.session) await this.login();
+    const s = this.session;
     try {
-      return await this._encryptedPost(p, payload);
+      return await this._encryptedPost(s, p, payload);
     } catch (err) {
       if (err instanceof DecoError && (err.code === 'timeout' || err.code === -5001)) {
-        await this.login();
-        return this._encryptedPost(p, payload);
+        // Another request may already have logged in again; only log in if not.
+        if (this.session === s || !this.session) await this.login();
+        return this._encryptedPost(this.session, p, payload);
       }
       throw err;
     }
   }
 
   async logout() {
-    if (!this.loggedIn) return;
+    const s = this.session;
+    this.session = null;
+    this._cache.clear();
+    if (!s) return;
     try {
-      await this._encryptedPost('/admin/system?form=logout', { operation: 'logout' });
+      await this._encryptedPost(s, '/admin/system?form=logout', { operation: 'logout' });
     } catch {
       // best effort
     }
-    this._reset();
   }
 }
 

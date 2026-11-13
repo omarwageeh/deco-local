@@ -162,8 +162,30 @@ const VIEWS = {
   more: { title: 'More', render: renderMore },
 };
 
-function setActions(html) {
-  $('#view-actions').innerHTML = html;
+// Each tab keeps its own pane (and header actions), so switching back to a tab
+// shows its last content instantly while fresh data loads in the background.
+function child(parent, attr, tab) {
+  let el = parent.querySelector(`:scope > [data-${attr}="${tab}"]`);
+  if (!el) {
+    el = document.createElement('div');
+    el.dataset[attr] = tab;
+    el.className = attr;
+    parent.appendChild(el);
+  }
+  return el;
+}
+const pane = (tab) => child($('#view'), 'pane', tab);
+
+function setActions(tab, html) {
+  const el = child($('#view-actions'), 'actions', tab);
+  el.innerHTML = html;
+  return el;
+}
+
+async function refresh(tab, btn) {
+  btn.disabled = true;
+  await go(tab);
+  btn.disabled = false;
 }
 
 async function go(tab, { quiet = false } = {}) {
@@ -172,17 +194,22 @@ async function go(tab, { quiet = false } = {}) {
   const v = VIEWS[tab];
   $('#view-title').textContent = v.title;
   $$('#tabbar button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
+  const p = pane(tab);
+  child($('#view-actions'), 'actions', tab);
+  $$('#view > [data-pane]').forEach((el) => (el.hidden = el !== p));
+  $$('#view-actions > [data-actions]').forEach((el) => (el.hidden = el.dataset.actions !== tab));
+  const fresh = !p.hasChildNodes() || !!p.querySelector(':scope > .loading, :scope > .notice.warn');
+  if (fresh) p.innerHTML = loadingHtml;
   if (!quiet) {
-    setActions('');
-    $('#view').innerHTML = loadingHtml;
     try {
       history.replaceState(null, '', '#' + tab);
     } catch {}
   }
   try {
-    await v.render({ quiet });
+    await v.render({ quiet: !fresh });
   } catch (err) {
-    if (state.tab === tab && !quiet) $('#view').innerHTML = errorHtml(err.message);
+    if (fresh) p.innerHTML = errorHtml(err.message);
+    else if (!quiet) toast(err.message, true);
   }
   if (v.refreshMs && state.tab === tab) scheduleRefresh(tab, v.refreshMs);
 }
@@ -206,9 +233,8 @@ $('#tabbar').addEventListener('click', (e) => {
 
 async function renderOverview() {
   const o = await api('GET', '/api/overview');
-  if (state.tab !== 'overview') return;
-  setActions('<button class="icon-btn" id="refresh">Refresh</button>');
-  $('#refresh').onclick = () => go('overview');
+  const acts = setActions('overview', '<button class="icon-btn" data-refresh>Refresh</button>');
+  acts.querySelector('[data-refresh]').onclick = (e) => refresh('overview', e.target);
 
   const status = String(o.internet.status || '').toLowerCase();
   const cls = status === 'online' ? 'ok' : status === 'offline' ? 'bad' : 'unknown';
@@ -217,7 +243,7 @@ async function renderOverview() {
   const mem = pct(o.performance.mem);
   const wan = o.wan;
 
-  $('#view').innerHTML = `
+  pane('overview').innerHTML = `
     <div class="card">
       <div class="hero">
         <div class="hero-dot ${cls}">${cls === 'bad' ? ICONS.off : ICONS.globe}</div>
@@ -263,17 +289,17 @@ function prettyDial(t) {
 
 async function renderDecos() {
   const { decos } = await api('GET', '/api/decos');
-  if (state.tab !== 'decos') return;
-  setActions(decos.length > 1 ? '<button class="btn small danger" id="reboot-all">Reboot all</button>' : '');
-  if ($('#reboot-all')) {
-    $('#reboot-all').onclick = () => reboot(decos.map((d) => d.mac), 'all Decos');
+  const acts = setActions('decos', decos.length > 1 ? '<button class="btn small danger" data-reboot-all>Reboot all</button>' : '');
+  if (decos.length > 1) {
+    acts.querySelector('[data-reboot-all]').onclick = () => reboot(decos.map((d) => d.mac), 'all Decos');
   }
+  const p = pane('decos');
   if (!decos.length) {
-    $('#view').innerHTML = '<div class="empty">No Decos found.</div>';
+    p.innerHTML = '<div class="empty">No Decos found.</div>';
     return;
   }
   const sorted = [...decos].sort((a, b) => (a.role === 'master' ? -1 : b.role === 'master' ? 1 : a.name.localeCompare(b.name)));
-  $('#view').innerHTML = sorted
+  p.innerHTML = sorted
     .map((d) => {
       const signal = d.signal && typeof d.signal === 'object'
         ? Object.entries(d.signal).map(([k, v]) => `${connLabel(k)}: ${v}`).join(', ')
@@ -302,12 +328,14 @@ async function renderDecos() {
       </div>`;
     })
     .join('');
-  $$('[data-reboot]').forEach((b) => (b.onclick = () => reboot([b.dataset.reboot], b.dataset.name)));
-  $$('[data-clients]').forEach(
+  $$('[data-reboot]', p).forEach((b) => (b.onclick = () => reboot([b.dataset.reboot], b.dataset.name)));
+  $$('[data-clients]', p).forEach(
     (b) =>
       (b.onclick = () => {
         state.clientFilter = 'deco:' + b.dataset.clients;
         go('clients');
+        // Apply the filter to the list we already have while it refreshes.
+        if (state.clients && $('#client-list')) drawClients();
       })
   );
 }
@@ -332,13 +360,13 @@ async function reboot(macs, label) {
 
 async function renderClients({ quiet }) {
   const { clients } = await api('GET', '/api/clients');
-  if (state.tab !== 'clients') return;
   state.clients = clients;
-  if (!quiet || !$('#client-list')) {
-    setActions('<button class="icon-btn" id="refresh">Refresh</button>');
-    $('#refresh').onclick = () => go('clients');
+  const p = pane('clients');
+  if (!quiet || !p.querySelector('#client-list')) {
+    const acts = setActions('clients', '<button class="icon-btn" data-refresh>Refresh</button>');
+    acts.querySelector('[data-refresh]').onclick = (e) => refresh('clients', e.target);
     const decos = [...new Map(clients.filter((c) => c.deco).map((c) => [c.deco.mac, c.deco])).values()];
-    $('#view').innerHTML = `
+    p.innerHTML = `
       <div class="toolbar"><input id="client-search" type="search" placeholder="Search name, IP or MAC" value="${esc(state.clientSearch)}" /></div>
       <div class="toolbar chips" id="client-chips">
         ${[['all', 'All'], ['wifi', 'Wi-Fi'], ['wired', 'Wired'], ['offline', 'Offline']]
@@ -417,8 +445,7 @@ function clientDetails(c) {
 
 async function renderWifi() {
   const w = await api('GET', '/api/wifi');
-  if (state.tab !== 'wifi') return;
-  setActions('');
+  const p = pane('wifi');
   const netCard = (band, kind, n) =>
     n
       ? `<div class="card">
@@ -439,7 +466,7 @@ async function renderWifi() {
   const powerBands = power ? ['band2_4', 'band5_1', 'band5_2', 'band6'].filter((k) => power[k]) : [];
   const bandLabel = { band2_4: '2.4 GHz', band5_1: '5 GHz', band5_2: '5 GHz-2', band6: '6 GHz' };
 
-  $('#view').innerHTML = `
+  p.innerHTML = `
     ${w.bands.map((b) => `<h2>${esc(b.label)}</h2>${netCard(b, 'host', b.host)}${netCard(b, 'guest', b.guest)}`).join('')}
     ${powerBands.length ? `
       <h2>Transmit power</h2>
@@ -452,7 +479,7 @@ async function renderWifi() {
           .join('')}
       </div>` : ''}`;
 
-  $$('[data-edit]').forEach(
+  $$('[data-edit]', p).forEach(
     (b) =>
       (b.onclick = () => {
         const [key, kind] = b.dataset.edit.split(':');
@@ -460,7 +487,7 @@ async function renderWifi() {
         editNetwork(band, kind, band[kind]);
       })
   );
-  $$('[data-power]').forEach(
+  $$('[data-power]', p).forEach(
     (s) =>
       (s.onchange = async () => {
         s.disabled = true;
@@ -531,14 +558,17 @@ const KNOWN_ENDPOINTS = [
 
 async function renderMore() {
   const [{ toggles }, sys] = await Promise.all([api('GET', '/api/toggles'), api('GET', '/api/system')]);
-  if (state.tab !== 'more') return;
-  setActions('<button class="btn small" id="logout">Log out</button>');
-  $('#logout').onclick = async () => {
+  const p = pane('more');
+  const acts = setActions('more', '<button class="btn small" data-logout>Log out</button>');
+  acts.querySelector('[data-logout]').onclick = async () => {
     await api('POST', '/api/logout').catch(() => {});
     showLogin();
   };
+  // The log and API console are built once, so refreshing doesn't wipe what you typed.
+  if (!p.querySelector('#more-live')) buildMoreTools(p);
+  const live = p.querySelector('#more-live');
   const t = sys.time || {};
-  $('#view').innerHTML = `
+  live.innerHTML = `
     <h2>System parameters</h2>
     ${toggles.length ? `<div class="list">${toggles
       .map(
@@ -562,28 +592,9 @@ async function renderMore() {
         (d) => `<div class="setting"><span>${esc(d.name)} <span class="muted">· ${esc(d.model || '')}</span></span>
         <button class="btn small danger" data-reboot="${esc(d.mac)}" data-name="${esc(d.name)}">Reboot</button></div>`
       )
-      .join('')}</div>
+      .join('')}</div>`;
 
-    <h2>System log</h2>
-    <div class="card">
-      <button class="btn small" id="load-logs">Load log</button>
-      <div id="logs"></div>
-    </div>
-
-    <h2>API console</h2>
-    <div class="card">
-      <p class="muted" style="margin:0 0 4px">Call any endpoint on the Deco directly. Use <b>read</b> to explore. Writes change your network.</p>
-      <label><span>Endpoint</span><input id="raw-path" list="raw-endpoints" value="admin/device?form=device_list" spellcheck="false" autocapitalize="off" class="mono" /></label>
-      <datalist id="raw-endpoints">${KNOWN_ENDPOINTS.map((e) => `<option value="${e}">`).join('')}</datalist>
-      <label><span>Operation</span><input id="raw-op" value="read" list="raw-ops" class="mono" /></label>
-      <datalist id="raw-ops"><option value="read"><option value="write"><option value="load"></datalist>
-      <label><span>Params (JSON, optional)</span><textarea id="raw-params" rows="3" class="mono" placeholder='{"device_mac":"default"}'></textarea></label>
-      <button class="btn primary" id="raw-send">Send</button>
-      <pre class="output" id="raw-out" hidden></pre>
-    </div>
-    <p class="muted" style="text-align:center;font-size:12px;margin-top:24px">Connected to ${esc(window.__host || '')}</p>`;
-
-  $$('[data-toggle]').forEach((input) => {
+  $$('[data-toggle]', live).forEach((input) => {
     input.onchange = async () => {
       const x = toggles[Number(input.dataset.toggle)];
       const value = input.checked;
@@ -613,7 +624,31 @@ async function renderMore() {
       }
     };
   });
-  $$('[data-reboot]').forEach((b) => (b.onclick = () => reboot([b.dataset.reboot], b.dataset.name)));
+  $$('[data-reboot]', live).forEach((b) => (b.onclick = () => reboot([b.dataset.reboot], b.dataset.name)));
+}
+
+function buildMoreTools(p) {
+  p.innerHTML = `
+    <div id="more-live"></div>
+
+    <h2>System log</h2>
+    <div class="card">
+      <button class="btn small" id="load-logs">Load log</button>
+      <div id="logs"></div>
+    </div>
+
+    <h2>API console</h2>
+    <div class="card">
+      <p class="muted" style="margin:0 0 4px">Call any endpoint on the Deco directly. Use <b>read</b> to explore. Writes change your network.</p>
+      <label><span>Endpoint</span><input id="raw-path" list="raw-endpoints" value="admin/device?form=device_list" spellcheck="false" autocapitalize="off" class="mono" /></label>
+      <datalist id="raw-endpoints">${KNOWN_ENDPOINTS.map((e) => `<option value="${e}">`).join('')}</datalist>
+      <label><span>Operation</span><input id="raw-op" value="read" list="raw-ops" class="mono" /></label>
+      <datalist id="raw-ops"><option value="read"><option value="write"><option value="load"></datalist>
+      <label><span>Params (JSON, optional)</span><textarea id="raw-params" rows="3" class="mono" placeholder='{"device_mac":"default"}'></textarea></label>
+      <button class="btn primary" id="raw-send">Send</button>
+      <pre class="output" id="raw-out" hidden></pre>
+    </div>
+    <p class="muted" style="text-align:center;font-size:12px;margin-top:24px">Connected to ${esc(window.__host || '')}</p>`;
 
   $('#load-logs').onclick = async (e) => {
     e.target.disabled = true;
@@ -669,6 +704,10 @@ async function renderMore() {
 
 function showLogin(host) {
   clearTimeout(state.timer);
+  // Drop cached tabs so the next login (maybe to another Deco) starts clean.
+  $('#view').innerHTML = '';
+  $('#view-actions').innerHTML = '';
+  state.clients = null;
   $('#app').hidden = true;
   $('#login').hidden = false;
   if (host !== undefined) $('#login-host').value = host;

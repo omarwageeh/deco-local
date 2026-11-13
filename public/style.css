@@ -92,7 +92,7 @@ label > span { display: block; font-size: 13px; font-weight: 600; color: var(--m
   border-bottom: 1px solid transparent;
 }
 .topbar h1 { font-size: 22px; }
-.topbar-actions { display: flex; gap: 6px; }
+.topbar-actions, .topbar-actions > .actions { display: flex; gap: 6px; }
 .view { max-width: 760px; margin: 0 auto; padding: 4px 16px calc(96px + env(safe-area-inset-bottom)); }
 .tabbar {
   position: fixed; bottom: 0; left: 0; right: 0; z-index: 5; display: flex; justify-content: center;

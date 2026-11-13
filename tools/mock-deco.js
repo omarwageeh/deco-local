@@ -129,7 +129,7 @@ function deepMerge(target, src) {
   return target;
 }
 
-function createMockDeco({ password = 'decopass', rejectWlanWrites = false } = {}) {
+function createMockDeco({ password = 'decopass', rejectWlanWrites = false, delayMs = 0 } = {}) {
   const pwdKey = makeRsa(1024);
   const signKey = makeRsa(512);
   const seq = crypto.randomInt(1e8, 9e8);
@@ -175,7 +175,9 @@ function createMockDeco({ password = 'decopass', rejectWlanWrites = false } = {}
   const server = http.createServer((req, res) => {
     let raw = '';
     req.on('data', (c) => (raw += c));
-    req.on('end', () => {
+    // `delayMs` simulates a real Deco's per-request latency.
+    req.on('end', () => setTimeout(handle, delayMs));
+    function handle() {
       const m = req.url.match(/^\/cgi-bin\/luci\/;stok=([^/]*)\/(.+)$/);
       const reply = (obj, headers = {}) => {
         res.writeHead(200, { 'Content-Type': 'application/json', ...headers });
@@ -247,7 +249,7 @@ function createMockDeco({ password = 'decopass', rejectWlanWrites = false } = {}
       const result = handleAdmin(path, payload);
       const out = result.__error ? { error_code: result.__error } : { error_code: 0, result };
       reply({ data: aes('enc', JSON.stringify(out), sess.key, sess.iv) });
-    });
+    }
   });
 
   mock.server = server;
@@ -262,7 +264,10 @@ module.exports = { createMockDeco };
 
 if (require.main === module) {
   const port = parseInt(process.env.MOCK_PORT || '8787', 10);
-  const mock = createMockDeco({ password: process.env.MOCK_PASSWORD || 'decopass' });
+  const mock = createMockDeco({
+    password: process.env.MOCK_PASSWORD || 'decopass',
+    delayMs: parseInt(process.env.MOCK_DELAY_MS || '0', 10),
+  });
   mock.listen(port).then((p) => {
     console.log(`Mock Deco listening on http://127.0.0.1:${p}`);
     console.log(`In Deco Local, log in with address "127.0.0.1:${p}" and password "${mock.password}".`);

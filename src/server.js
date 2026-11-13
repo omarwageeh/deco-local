@@ -127,6 +127,11 @@ const TOGGLES = [
   { form: 'admin/network?form=fast_xmit_setting', field: 'enable', label: 'Wireless Forward' },
 ];
 
+// Several tabs need these lists; a short cache lets switching tabs reuse them.
+const listDecos = (client) => client.request('admin/device?form=device_list', 'read', undefined, { cacheMs: 5000 });
+const listClients = (client, mac = 'default') =>
+  client.request('admin/client?form=client_list', 'read', { device_mac: mac }, { cacheMs: 3000 });
+
 // ---------- HTTP plumbing ----------
 
 function send(res, status, body, headers = {}) {
@@ -251,8 +256,8 @@ const routes = {
       settle(client.request('admin/network?form=wan_ipv4')),
       settle(client.request('admin/network?form=lan_ip', 'read', { device_mac: 'default' })),
       settle(client.request('admin/network?form=performance')),
-      settle(client.request('admin/device?form=device_list')),
-      settle(client.request('admin/client?form=client_list', 'read', { device_mac: 'default' })),
+      settle(listDecos(client)),
+      settle(listClients(client)),
     ]);
     const deviceList = decos.ok ? (decos.value.device_list || []).map(normalizeDeco) : [];
     const clientList = clientsList.ok ? (clientsList.value.client_list || []).map(normalizeClient) : [];
@@ -275,20 +280,17 @@ const routes = {
   },
 
   'GET /api/decos': async (req, res, body, { client }) => {
-    const r = await client.request('admin/device?form=device_list');
+    const r = await listDecos(client);
     return { decos: (r.device_list || []).map(normalizeDeco) };
   },
 
   'GET /api/clients': async (req, res, body, { client }) => {
-    const all = await client.request('admin/client?form=client_list', 'read', { device_mac: 'default' });
+    const [all, decos] = await Promise.all([listClients(client), settle(listDecos(client))]);
     const list = (all.client_list || []).map(normalizeClient);
     // Ask each Deco for its own clients so we can show which one a device is attached to.
-    const decos = await settle(client.request('admin/device?form=device_list'));
     if (decos.ok) {
       const units = (decos.value.device_list || []).map(normalizeDeco);
-      const perDeco = await Promise.all(
-        units.map((d) => settle(client.request('admin/client?form=client_list', 'read', { device_mac: d.mac })))
-      );
+      const perDeco = await Promise.all(units.map((d) => settle(listClients(client, d.mac))));
       const owner = new Map();
       perDeco.forEach((r, i) => {
         if (!r.ok) return;
@@ -382,7 +384,7 @@ const routes = {
   'GET /api/system': async (req, res, body, { client }) => {
     const [time, decos] = await Promise.all([
       settle(client.request('admin/device?form=timesetting')),
-      settle(client.request('admin/device?form=device_list')),
+      settle(listDecos(client)),
     ]);
     return {
       time: time.ok ? time.value : { error: time.error },

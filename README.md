@@ -38,6 +38,7 @@ Wrong passwords count toward the Deco's lockout. After several failures it block
 | `PORT` | `8686` | Port for the web UI |
 | `BIND` | `0.0.0.0` | Use `127.0.0.1` to allow only this PC |
 | `DECO_LOCAL_CONFIG` | `./deco-config.json` | Where the last-used Deco address is stored (the password is never saved) |
+| `DECO_DEBUG` | off | Set to `1` to log every Deco request and how long it took. Requests slower than 1.5 s are always logged. |
 
 ## Things to know
 
@@ -53,7 +54,15 @@ npm run mock       # fake Deco on 127.0.0.1:8787, password "decopass"
 npm start          # then log in to 127.0.0.1:8787
 ```
 
-The mock implements the real protocol, including RSA-signed requests, AES-encrypted payloads and session tokens, and keeps state so changes stick.
+The mock implements the real protocol, including RSA-signed requests, AES-encrypted payloads and session tokens, and keeps state so changes stick. Set `MOCK_DELAY_MS=300` to make it as slow as a real Deco.
+
+## Why it's fast
+
+A Deco closes the connection after every response, so each request needs a new TLS connection, about 0.3–0.5 s on its CPU. Deco Local does three things about that:
+
+- It resumes TLS sessions instead of doing full handshakes.
+- It sends requests in parallel, like the Deco's own web page does, so a screen takes about one round trip.
+- It briefly caches the Deco and client lists so switching tabs reuses them, and the UI shows each tab's last data instantly while it refreshes.
 
 ## Tests
 
