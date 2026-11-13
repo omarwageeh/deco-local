@@ -78,3 +78,7 @@ See the header comment in [`src/deco-client.js`](src/deco-client.js). In short:
 2. Pick a random AES-128-CBC key.
 3. Send every request as `sign=<RSA(k,i,md5("admin"+pwd),seq+len)>&data=<AES(json)>`.
 4. Login returns a `stok` token and a `sysauth` cookie.
+
+## License
+
+[MIT](LICENSE). Deco Local is not affiliated with or endorsed by TP-Link. "Deco" and "TP-Link" are trademarks of TP-Link.
