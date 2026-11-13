@@ -1,0 +1,16 @@
+{
+  "name": "deco-local",
+  "version": "0.1.0",
+  "description": "Manage TP-Link Deco mesh devices over the local network, no internet or cloud account required.",
+  "private": true,
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "mock": "node tools/mock-deco.js",
+    "test": "node --test test/"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f766e" />
+  <title>Deco Local</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Login -->
+  <section id="login" class="login" hidden>
+    <form id="login-form" class="login-card" autocomplete="on">
+      <img src="icon.svg" alt="" class="login-logo" width="56" height="56" />
+      <h1>Deco Local</h1>
+      <p class="muted">Manage your Deco mesh over your local network. No internet needed.</p>
+      <label>
+        <span>Deco address</span>
+        <input id="login-host" name="host" required placeholder="192.168.68.1" autocapitalize="off" spellcheck="false" />
+      </label>
+      <label>
+        <span>Password</span>
+        <input id="login-password" name="password" type="password" required autocomplete="current-password" />
+      </label>
+      <p class="hint">Use your Deco's local management password. On most setups that's the password of the TP-Link ID that owns the network.</p>
+      <p id="login-error" class="error" hidden></p>
+      <button class="btn primary block" type="submit" id="login-btn">Log in</button>
+    </form>
+  </section>
+
+  <!-- App -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <h1 id="view-title">Overview</h1>
+      <div class="topbar-actions" id="view-actions"></div>
+    </header>
+    <main id="view" class="view"></main>
+    <nav class="tabbar" id="tabbar">
+      <button data-tab="overview" class="active"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg><span>Overview</span></button>
+      <button data-tab="decos"><svg viewBox="0 0 24 24"><rect x="6" y="3" width="12" height="18" rx="6"/><circle cx="12" cy="17" r="1"/></svg><span>Decos</span></button>
+      <button data-tab="clients"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg><span>Clients</span></button>
+      <button data-tab="wifi"><svg viewBox="0 0 24 24"><path d="M2 9a15 15 0 0 1 20 0M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0"/><circle cx="12" cy="19.5" r="1"/></svg><span>Wi-Fi</span></button>
+      <button data-tab="more"><svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg><span>More</span></button>
+    </nav>
+  </div>
+
+  <dialog id="dialog"><form method="dialog" id="dialog-form"></form></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
