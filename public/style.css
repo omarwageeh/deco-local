@@ -116,6 +116,7 @@ label > span { display: block; font-size: 13px; font-weight: 600; color: var(--m
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 12px 0 0; font-size: 14px; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; text-align: right; overflow-wrap: anywhere; }
+.kv-group { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin: 14px 0 -4px; }
 .card-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 
 .hero { display: flex; align-items: center; gap: 16px; }
@@ -201,6 +202,13 @@ pre.output {
 }
 .log-line { font: 12.5px/1.45 ui-monospace, Consolas, monospace; padding: 6px 14px; border-top: 1px solid var(--border); }
 .log-line:first-child { border-top: 0; }
+
+.choice {
+  display: flex; align-items: flex-start; gap: 10px; margin: 8px 0; padding: 10px 12px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 10px; font-size: 14px;
+}
+.choice input { width: auto; margin: 3px 0 0; accent-color: var(--accent); }
+.choice:has(input[type=radio]:checked) { border-color: var(--accent); background: var(--accent-soft); }
 
 /* Dialog */
 dialog {

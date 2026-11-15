@@ -2,10 +2,13 @@
 
 // A fake Deco that implements the server side of the real local API protocol:
 // RSA-PKCS1 password + signature checks, AES-CBC payloads, stok + sysauth cookie.
+// It also runs the Deco app's TMP protocol over SSH (see src/tmp-client.js).
 // Used by the tests, and runnable on its own as a demo:  npm run mock
 
 const crypto = require('node:crypto');
 const http = require('node:http');
+const { Server: SshServer } = require('ssh2');
+const { crc32, tmpFrame, bizPacket, parseBiz, sha1Hex, OP } = require('../src/tmp-client');
 
 const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
 
@@ -106,16 +109,29 @@ function initialState() {
       'admin/device?form=timesetting': { date: '2026-11-13', time: '13:45:10', timezone: 'GMT+02:00', tz_region: 'Africa/Cairo' },
       'admin/network?form=performance': { cpu_usage: 0.12, mem_usage: 0.46 },
       'admin/network?form=internet': { ipv4: { inet_status: 'offline', dial_type: 'dynamic_ip' } },
-      'admin/network?form=wan_ipv4': {
-        wan: { dial_type: 'dynamic_ip', ip_info: { ip: '0.0.0.0', mask: '0.0.0.0', gateway: '0.0.0.0', dns1: '', dns2: '' } },
-        lan: { ip_info: { ip: '192.168.68.1', mask: '255.255.252.0' } },
-      },
       'admin/network?form=lan_ip': { mac_addr: 'AA-BB-CC-00-00-01', lan_ip: { ip: '192.168.68.1', mask: '255.255.252.0' } },
     },
     logs: [
       { time: '2026-11-13 13:01:02', level: 'INFO', type: 'System', content: 'Deco started' },
       { time: '2026-11-13 13:02:40', level: 'WARN', type: 'Internet', content: 'WAN link down' },
     ],
+    mode: 'Router',
+    // Shaped like a real Deco X-series on PPPoE (as read over TMP 0x4004). The password is
+    // never returned by the Deco; the mock keeps it separately so tests can check writes.
+    wan: {
+      enable_ping: false,
+      support_mtu_size: true,
+      user_info: { username: b64('user123@isp.example') },
+      mtu_size: 1480,
+      ip_info: { mac: 'AA-BB-CC-00-00-0F', dns2: '8.8.4.4', dns1: '8.8.8.8', mask: '255.255.255.255', gateway: '10.0.0.1', ip: '0.0.0.0' },
+      dial_type: 'pppoe',
+      service_info: { enable: false },
+      enable_auto_dns: false,
+    },
+    wanPassword: 'isp-secret-pw',
+    // Like a real Deco that doesn't report lease_time (so it can't be changed).
+    dhcp: { ip_amount_in_use: 5, end_ip: '192.168.71.249', dns2: '', dns1: '', start_ip: '192.168.68.100', gateway: '192.168.68.1' },
+    reservations: [],
     reboots: [],
     writes: [],
   };
@@ -129,7 +145,140 @@ function deepMerge(target, src) {
   return target;
 }
 
-function createMockDeco({ password = 'decopass', rejectWlanWrites = false, delayMs = 0 } = {}) {
+// Server side of the TMP protocol on one direct-tcpip stream.
+function serveTmp(stream, mock, { chunk }) {
+  let buf = Buffer.alloc(0);
+  let seq = 1;
+  const send = (packet) => stream.write(tmpFrame(packet, seq++));
+  const pending = new Map(); // txid -> { opcode, body } for responses sent in fragments
+  const reply = (opcode, txid, obj) => {
+    const body = Buffer.isBuffer(obj) ? obj : Buffer.from(JSON.stringify(obj));
+    // Exercise the client: a keep-alive and an unrelated push before each response.
+    stream.write(Buffer.from([1, 1, 4, 0]));
+    send(bizPacket(0x4015, 5, Buffer.from('{"result":{}}'), (txid + 7) & 0xffff));
+    const first = chunk ? body.subarray(0, chunk) : body;
+    if (chunk && body.length > chunk) pending.set(txid, { opcode, body });
+    send(bizPacket(opcode, 5, first, txid, { total: body.length }));
+  };
+
+  const handle = (payload) => {
+    const p = parseBiz(payload);
+    if (p.body.length && crc32(p.body) !== p.crc) return mock.tmp.errors.push('bad business crc');
+    if (p.ptype === 4) {
+      const r = pending.get(p.txid);
+      if (!r) return mock.tmp.errors.push('pull without pending response');
+      const part = r.body.subarray(p.offset, p.offset + chunk);
+      if (p.offset + chunk >= r.body.length) pending.delete(p.txid);
+      return send(bizPacket(r.opcode, 5, part, p.txid, { total: r.body.length, offset: p.offset }));
+    }
+    if (p.ptype !== 2) return mock.tmp.errors.push(`unexpected ptype ${p.ptype}`);
+    if (p.opcode === OP.ALLOC) return reply(p.opcode, p.txid, Buffer.from(crypto.randomBytes(16).toString('hex')));
+    const req = JSON.parse(p.body.toString('utf8'));
+    if (typeof req.config_version !== 'number') mock.tmp.errors.push('missing config_version');
+    mock.tmp.calls.push({ opcode: p.opcode, params: req.params });
+    if (p.opcode === OP.WAN_LAN_STATUS) {
+      return reply(p.opcode, p.txid, {
+        error_code: 0,
+        result: { wan: mock.state.wan, lan: { ip_info: { mac: 'AA-BB-CC-00-00-01', mask: '255.255.252.0', ip: '192.168.68.1' } } },
+      });
+    }
+    if (p.opcode === OP.WAN_IPV4_SET) {
+      const wan = req.params && req.params.wan;
+      const decode = (v) => Buffer.from(v, 'base64').toString('utf8');
+      if (!wan || !['dynamic_ip', 'static_ip', 'pppoe'].includes(wan.dial_type)) return reply(p.opcode, p.txid, { error_code: -1 });
+      if (wan.dial_type === 'pppoe') {
+        const ui = wan.user_info || {};
+        const switching = mock.state.wan.dial_type !== 'pppoe';
+        if (switching && (!ui.username || !ui.password)) return reply(p.opcode, p.txid, { error_code: -1 });
+        if (ui.username) mock.state.wan.user_info = { username: ui.username };
+        if (ui.password) mock.state.wanPassword = decode(ui.password);
+        mock.state.wanUsernamePlain = decode(mock.state.wan.user_info.username);
+      } else {
+        delete mock.state.wan.user_info;
+      }
+      const { user_info, ...rest } = wan;
+      Object.assign(mock.state.wan, rest);
+      if (wan.ip_info) mock.state.wan.ip_info = { ...mock.state.wan.ip_info, ...wan.ip_info };
+      return reply(p.opcode, p.txid, { error_code: 0 });
+    }
+    const s = mock.state;
+    const ok = (result) => reply(p.opcode, p.txid, result === undefined ? { error_code: 0 } : { error_code: 0, result });
+    const fail = () => reply(p.opcode, p.txid, { error_code: -1 });
+    if (p.opcode === OP.DHCP_SERVER) return ok(s.dhcp);
+    if (p.opcode === OP.DHCP_SERVER_SET) {
+      const v = req.params || {};
+      if (!v.start_ip || !v.end_ip || v.gateway !== s.dhcp.gateway) return fail();
+      if ('lease_time' in v && !('lease_time' in s.dhcp)) return fail();
+      Object.assign(s.dhcp, v);
+      return ok();
+    }
+    if (p.opcode === OP.RESERVATIONS) return ok({ reservation_list_max_count: 64, reservation_list: s.reservations });
+    if (p.opcode === OP.RESERVATION_ADD) {
+      const add = req.params?.reservation_list || [];
+      if (!add.length || add.some((r) => !r.ip || !r.mac || s.reservations.some((x) => x.mac === r.mac))) return fail();
+      s.reservations.push(...add.map(({ ip, mac }) => ({ ip, mac })));
+      return ok();
+    }
+    if (p.opcode === OP.RESERVATION_MODIFY) {
+      const v = req.params || {};
+      const r = s.reservations.find((x) => x.mac === v.original_mac && x.ip === v.original_ip);
+      if (!r) return fail();
+      Object.assign(r, { ip: v.ip, mac: v.mac });
+      return ok();
+    }
+    if (p.opcode === OP.RESERVATION_REMOVE) {
+      const macs = req.params?.reservation_list || [];
+      if (!macs.length) return fail();
+      s.reservations = s.reservations.filter((x) => !macs.includes(x.mac));
+      return ok();
+    }
+    if (p.opcode === OP.DHCP_LEASES) {
+      return ok({ client_lease: s.clients.filter((c) => c.online).map((c) => ({ mac: c.mac, ip: c.ip })) });
+    }
+    if (p.opcode === OP.OPERATION_MODE) {
+      return reply(p.opcode, p.txid, { error_code: 0, result: { mode: mock.state.mode, modeList: ['Router', 'AP'] } });
+    }
+    if (p.opcode === OP.OPERATION_MODE_SET) {
+      if (!['Router', 'AP'].includes(req.params?.mode)) return reply(p.opcode, p.txid, { error_code: -1 });
+      mock.state.mode = req.params.mode;
+      return reply(p.opcode, p.txid, { error_code: 0 });
+    }
+    reply(p.opcode, p.txid, { error_code: -40401 });
+  };
+
+  stream.on('data', (c) => {
+    buf = Buffer.concat([buf, c]);
+    for (;;) {
+      if (buf.length < 4) return;
+      if (buf[2] === 4) {
+        mock.tmp.pongs++;
+        buf = buf.subarray(4);
+        continue;
+      }
+      if (buf.length < 16) return;
+      const len = buf.readUInt16BE(4);
+      if (buf.length < 16 + len) return;
+      const frame = buf.subarray(0, 16 + len);
+      buf = buf.subarray(16 + len);
+      const check = Buffer.from(frame);
+      check.writeUInt32BE(0x5a6b7c8d, 12);
+      if (crc32(check) !== frame.readUInt32BE(12)) {
+        mock.tmp.errors.push('bad TMP crc');
+        continue;
+      }
+      handle(frame.subarray(16));
+    }
+  });
+}
+
+function createMockDeco({
+  password = 'decopass',
+  email = 'owner@example.com',
+  tmpPassword = password,
+  tmpChunk = 0,
+  rejectWlanWrites = false,
+  delayMs = 0,
+} = {}) {
   const pwdKey = makeRsa(1024);
   const signKey = makeRsa(512);
   const seq = crypto.randomInt(1e8, 9e8);
@@ -159,6 +308,17 @@ function createMockDeco({ password = 'decopass', rejectWlanWrites = false, delay
         if (operation !== 'reboot') return { __error: -1 };
         s.reboots.push(params.mac_list);
         return {};
+      case 'admin/network?form=wan_ipv4': {
+        // The HTTP view omits the MTU and service fields, like real firmware.
+        const { dial_type, user_info, ip_info, enable_auto_dns } = s.wan;
+        return {
+          wan: { user_info, ip_info, dial_type, info: {}, enable_auto_dns },
+          lan: { ip_info: { mac: 'AA-BB-CC-00-00-01', mask: '255.255.252.0', ip: '192.168.68.1' } },
+        };
+      }
+      case 'admin/device?form=mode':
+        if (operation !== 'read') return { __error: -40210 }; // read-only over HTTP, like the real web UI
+        return { sysmode: s.mode, workmode: s.mode === 'AP' ? 'AP' : 'Router' };
       case 'admin/log_export?form=feedback_log':
         return { logList: s.logs };
       case 'admin/system?form=logout':
@@ -252,11 +412,41 @@ function createMockDeco({ password = 'decopass', rejectWlanWrites = false, delay
     }
   });
 
+  // TMP over SSH, like port 20001 on a real Deco.
+  mock.tmp = { authAttempts: 0, calls: [], errors: [], pongs: 0 };
+  const hostKey = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+    publicKeyEncoding: { type: 'pkcs1', format: 'pem' },
+  }).privateKey;
+  const tmpServer = new SshServer({ hostKeys: [hostKey] }, (conn) => {
+    conn.on('authentication', (ctx) => {
+      if (ctx.method !== 'password') return ctx.reject(['password']);
+      mock.tmp.authAttempts++;
+      if (ctx.username === sha1Hex(email) && ctx.password === tmpPassword) ctx.accept();
+      else ctx.reject(['password']);
+    });
+    conn.on('ready', () => {
+      conn.on('tcpip', (accept, reject, info) => {
+        if (info.destIP !== '127.0.0.1' || info.destPort !== 20002) return reject();
+        serveTmp(accept(), mock, { chunk: tmpChunk });
+      });
+    });
+    conn.on('error', () => {});
+  });
+
   mock.server = server;
+  mock.tmpServer = tmpServer;
   mock.password = password;
+  mock.email = email;
   mock.listen = (port = 0, host = '127.0.0.1') =>
     new Promise((resolve) => server.listen(port, host, () => resolve(server.address().port)));
-  mock.close = () => new Promise((resolve) => server.close(resolve));
+  mock.listenTmp = (port = 0, host = '127.0.0.1') =>
+    new Promise((resolve) => tmpServer.listen(port, host, () => resolve(tmpServer.address().port)));
+  mock.close = async () => {
+    await new Promise((resolve) => server.close(resolve));
+    if (tmpServer.address()) await new Promise((resolve) => tmpServer.close(resolve));
+  };
   return mock;
 }
 
@@ -268,8 +458,11 @@ if (require.main === module) {
     password: process.env.MOCK_PASSWORD || 'decopass',
     delayMs: parseInt(process.env.MOCK_DELAY_MS || '0', 10),
   });
-  mock.listen(port).then((p) => {
-    console.log(`Mock Deco listening on http://127.0.0.1:${p}`);
+  const tmpPort = parseInt(process.env.MOCK_TMP_PORT || '20001', 10);
+  Promise.all([mock.listen(port), mock.listenTmp(tmpPort)]).then(([p, t]) => {
+    console.log(`Mock Deco listening on http://127.0.0.1:${p} (TMP/SSH on port ${t})`);
     console.log(`In Deco Local, log in with address "127.0.0.1:${p}" and password "${mock.password}".`);
+    console.log(`For operation mode, use TP-Link ID "${mock.email}" (same password).`);
+    if (t !== 20001) console.log(`Start Deco Local with DECO_TMP_PORT=${t} so it finds the TMP port.`);
   });
 }

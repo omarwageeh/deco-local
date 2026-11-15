@@ -30,7 +30,7 @@ async function api(method, url, body) {
     showLogin();
     throw new Error('Please log in again.');
   }
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.code });
   return data;
 }
 
@@ -423,9 +423,9 @@ function drawClients() {
   $$('#client-list .row').forEach((r) => (r.onclick = () => clientDetails(state.clients.find((c) => c.mac === r.dataset.mac))));
 }
 
-function clientDetails(c) {
+async function clientDetails(c) {
   if (!c) return;
-  openDialog(`
+  const reserve = await openDialog(`
     <h3>${esc(c.name)}</h3>
     <dl class="kv">
       <dt>Status</dt><dd>${c.online ? 'Online' : 'Offline'}</dd>
@@ -438,7 +438,148 @@ function clientDetails(c) {
       <dt>Upload</dt><dd>${speed(c.upKBps)}</dd>
     </dl>
     <details style="margin-top:14px"><summary class="muted">Raw data</summary><pre class="output">${esc(JSON.stringify(c.raw, null, 2))}</pre></details>
-    <div class="dialog-actions"><button class="btn" value="cancel">Close</button></div>`);
+    <div class="dialog-actions"><button class="btn" value="cancel">Close</button><button class="btn primary" value="ok">Reserve IP</button></div>`);
+  if (reserve) reserveForDevice({ mac: c.mac, ip: c.ip, name: c.name });
+}
+
+// ---------- DHCP ----------
+
+// Loaded on demand: it goes through the Deco app's protocol, which needs the TP-Link ID.
+async function loadDhcp(mode) {
+  const data = await withTpLinkId(mode, (creds) => api('POST', '/api/dhcp', creds));
+  if (data) state.dhcp = data;
+  return data;
+}
+
+// Applies a DHCP change and redraws the DHCP card if it's on screen.
+async function dhcpWrite(url, body, message) {
+  state.dhcp = await api('POST', url, body);
+  toast(message);
+  const box = $('[data-dhcp-body]');
+  if (box) drawDhcp(box);
+}
+
+function drawDhcp(box) {
+  const d = state.dhcp;
+  if (!d) {
+    box.innerHTML = '';
+    return;
+  }
+  const sv = d.server;
+  const dns = [sv.dns1, sv.dns2].filter(Boolean).join(', ') || 'The Deco (automatic)';
+  const deviceLabel = (x) => x.name || x.mac;
+  box.innerHTML = `
+    <dl class="kv">
+      <dt>Address range</dt><dd class="mono">${esc(sv.start)} – ${esc(sv.end)}</dd>
+      <dt>Deco address</dt><dd class="mono">${esc(sv.gateway)}</dd>
+      ${sv.inUse != null ? `<dt>Addresses in use</dt><dd>${sv.inUse}</dd>` : ''}
+      <dt>DNS for devices</dt><dd>${esc(dns)}</dd>
+      ${sv.leaseTime != null ? `<dt>Lease time</dt><dd>${sv.leaseTime} min</dd>` : ''}
+    </dl>
+    <div class="card-actions"><button class="btn small" data-dhcp-edit>Edit DHCP server</button></div>
+
+    <div class="kv-group" style="margin-top:18px">Address reservations · ${d.reservations.length}${d.maxReservations ? ` of ${d.maxReservations}` : ''}</div>
+    ${
+      d.reservations.length
+        ? `<div class="list" style="margin-top:10px">${d.reservations
+            .map(
+              (r) => `<div class="row">
+          <div class="row-main"><div class="row-title">${esc(deviceLabel(r))}</div><div class="row-sub mono">${esc(r.ip)} · ${esc(r.mac)}</div></div>
+          <button class="btn small" data-res-edit="${esc(r.mac)}">Edit</button>
+          <button class="btn small danger" data-res-remove="${esc(r.mac)}">Remove</button></div>`
+            )
+            .join('')}</div>`
+        : '<p class="muted" style="margin:8px 0 0">No reserved addresses. Reserve one so a device always gets the same IP.</p>'
+    }
+    <div class="card-actions"><button class="btn small" data-res-add>Reserve an address</button></div>
+
+    <div class="kv-group" style="margin-top:18px">Devices with an address now · ${d.leases.length}</div>
+    <div class="list" style="margin-top:10px;max-height:360px;overflow:auto">${d.leases
+      .map(
+        (l) => `<div class="row">
+        <div class="row-main"><div class="row-title">${esc(deviceLabel(l))}</div><div class="row-sub mono">${esc(l.ip)} · ${esc(l.mac)}</div></div>
+        ${l.reserved ? '<span class="badge accent">Reserved</span>' : `<button class="btn small" data-lease-reserve="${esc(l.mac)}">Reserve</button>`}</div>`
+      )
+      .join('')}</div>`;
+
+  $('[data-dhcp-edit]', box).onclick = () => editDhcpServer();
+  $('[data-res-add]', box).onclick = () => reservationDialog({});
+  $$('[data-res-edit]', box).forEach((b) => (b.onclick = () => reservationDialog({ original: d.reservations.find((r) => r.mac === b.dataset.resEdit) })));
+  $$('[data-res-remove]', box).forEach(
+    (b) =>
+      (b.onclick = async () => {
+        const r = d.reservations.find((x) => x.mac === b.dataset.resRemove);
+        if (!(await confirmDialog(`Remove the reservation for ${deviceLabel(r)}?`, `${r.ip} goes back to being handed out automatically.`, 'Remove', true))) return;
+        try {
+          await dhcpWrite('/api/dhcp/reservations', { action: 'remove', macs: [r.mac] }, 'Reservation removed');
+        } catch (err) {
+          toast(err.message, true);
+        }
+      })
+  );
+  $$('[data-lease-reserve]', box).forEach((b) => {
+    const l = d.leases.find((x) => x.mac === b.dataset.leaseReserve);
+    b.onclick = () => reservationDialog({ mac: l.mac, ip: l.ip, name: l.name });
+  });
+}
+
+function editDhcpServer() {
+  const sv = state.dhcp.server;
+  const field = (name, label, value, attrs = '') =>
+    `<label><span>${label}</span><input name="${name}" value="${esc(value ?? '')}" inputmode="decimal" ${attrs} /></label>`;
+  openDialog(
+    `
+    <h3>DHCP server</h3>
+    <p class="muted" style="margin:0">The Deco is <b class="mono">${esc(sv.gateway)}</b> on network mask <span class="mono">${esc(sv.mask)}</span>.</p>
+    ${field('start', 'Start address', sv.start, 'required')}
+    ${field('end', 'End address', sv.end, 'required')}
+    ${field('dns1', 'Primary DNS', sv.dns1, 'placeholder="Blank: use the Deco"')}
+    ${field('dns2', 'Secondary DNS', sv.dns2, 'placeholder="Optional"')}
+    ${sv.leaseTime != null ? `<label><span>Lease time (minutes)</span><input name="leaseTime" type="number" min="1" max="1440" required value="${esc(sv.leaseTime)}" /></label>` : ''}
+    <div class="notice">Devices pick up a new range when their lease renews. Reconnect a device to apply it sooner.</div>
+    <div class="dialog-actions"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Save</button></div>`,
+    async (fd) => {
+      const body = { start: fd.get('start'), end: fd.get('end'), dns1: fd.get('dns1'), dns2: fd.get('dns2') };
+      if (fd.has('leaseTime')) body.leaseTime = Number(fd.get('leaseTime'));
+      await dhcpWrite('/api/dhcp/server', body, 'DHCP server saved');
+      return true;
+    }
+  );
+}
+
+// Add a reservation (optionally prefilled from a device) or edit `original`.
+function reservationDialog({ mac = '', ip = '', name = '', original = null }) {
+  const sv = state.dhcp.server;
+  const editing = !!original;
+  openDialog(
+    `
+    <h3>${editing ? 'Edit reservation' : 'Reserve an address'}</h3>
+    ${name || original?.name ? `<p class="muted" style="margin:0">${esc(name || original.name)}</p>` : ''}
+    <label><span>Device MAC address</span><input name="mac" required class="mono" autocapitalize="characters" spellcheck="false"
+      placeholder="AA-BB-CC-DD-EE-FF" value="${esc(editing ? original.mac : mac)}" /></label>
+    <label><span>Reserved IP address</span><input name="ip" required class="mono" inputmode="decimal" value="${esc(editing ? original.ip : ip)}" /></label>
+    <p class="hint">Must be on the Deco's network (${esc(sv.gateway)} / ${esc(sv.mask)}). The device gets it the next time it connects.</p>
+    <div class="dialog-actions"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">${editing ? 'Save' : 'Reserve'}</button></div>`,
+    async (fd) => {
+      const body = editing
+        ? { action: 'modify', originalMac: original.mac, mac: fd.get('mac'), ip: fd.get('ip') }
+        : { action: 'add', mac: fd.get('mac'), ip: fd.get('ip') };
+      await dhcpWrite('/api/dhcp/reservations', body, editing ? 'Reservation saved' : 'Address reserved');
+      return true;
+    }
+  );
+}
+
+// From the Clients tab: make sure DHCP data is loaded, then add or edit this device's reservation.
+async function reserveForDevice(device) {
+  try {
+    const mode = await api('GET', '/api/mode');
+    if (!(await loadDhcp(mode))) return;
+    const existing = state.dhcp.reservations.find((r) => r.mac === device.mac);
+    reservationDialog(existing ? { original: existing } : device);
+  } catch (err) {
+    toast(err.message, true);
+  }
 }
 
 // ---------- Wi-Fi ----------
@@ -557,7 +698,12 @@ const KNOWN_ENDPOINTS = [
 ];
 
 async function renderMore() {
-  const [{ toggles }, sys] = await Promise.all([api('GET', '/api/toggles'), api('GET', '/api/system')]);
+  const [{ toggles }, sys, mode, internet] = await Promise.all([
+    api('GET', '/api/toggles'),
+    api('GET', '/api/system'),
+    api('GET', '/api/mode').catch((err) => ({ error: err.message })),
+    api('GET', '/api/internet').catch((err) => ({ error: err.message, rows: [] })),
+  ]);
   const p = pane('more');
   const acts = setActions('more', '<button class="btn small" data-logout>Log out</button>');
   acts.querySelector('[data-logout]').onclick = async () => {
@@ -569,6 +715,46 @@ async function renderMore() {
   const live = p.querySelector('#more-live');
   const t = sys.time || {};
   live.innerHTML = `
+    <h2>Internet connection</h2>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">${esc(internet.dialType || 'Unknown')}</div>
+          <div class="card-sub">${esc(internet.error || 'Everything the Deco reports about its internet connection. Read-only for now.')}</div>
+        </div>
+      </div>
+      ${internetRowsHtml(internet.rows || [])}
+      <div data-internet-app></div>
+      <div class="card-actions">
+        <button class="btn small primary" data-internet-edit ${mode.busySeconds ? 'disabled' : ''}>Edit</button>
+        <button class="btn small" data-internet-app-btn>Show the Deco app's view</button>
+      </div>
+    </div>
+
+    <h2>DHCP</h2>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">DHCP server and reservations</div>
+          <div class="card-sub">The addresses the Deco hands out, fixed addresses for your devices, and who has an address now.</div>
+        </div>
+      </div>
+      <div data-dhcp-body></div>
+      <div class="card-actions" data-dhcp-load-row ${state.dhcp ? 'hidden' : ''}><button class="btn small" data-dhcp-load>Show DHCP settings</button></div>
+    </div>
+
+    <h2>Operation mode</h2>
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <div class="card-title">${esc(mode.label || (mode.error ? 'Unknown' : 'Router'))}</div>
+          <div class="card-sub">${esc(MODE_INFO[mode.mode] || (mode.error ? mode.error : ''))}</div>
+        </div>
+        <button class="btn small" data-mode-change ${mode.busySeconds ? 'disabled' : ''}>Change</button>
+      </div>
+      ${mode.busySeconds ? `<div class="notice" style="margin:12px 0 0">The Deco is applying the last change. You can change the mode again in about ${mode.busySeconds} s.</div>` : ''}
+    </div>
+
     <h2>System parameters</h2>
     ${toggles.length ? `<div class="list">${toggles
       .map(
@@ -625,6 +811,227 @@ async function renderMore() {
     };
   });
   $$('[data-reboot]', live).forEach((b) => (b.onclick = () => reboot([b.dataset.reboot], b.dataset.name)));
+  $('[data-mode-change]', live).onclick = () => changeMode(mode);
+  $('[data-internet-app-btn]', live).onclick = (e) => showAppInternetView(mode, $('[data-internet-app]', live), e.target);
+  $('[data-internet-edit]', live).onclick = (e) => editInternet(mode, e.target);
+  drawDhcp($('[data-dhcp-body]', live));
+  $('[data-dhcp-load]', live).onclick = async (e) => {
+    e.target.disabled = true;
+    try {
+      if (await loadDhcp(mode)) {
+        drawDhcp($('[data-dhcp-body]', live));
+        $('[data-dhcp-load-row]', live).hidden = true;
+      }
+    } finally {
+      e.target.disabled = false;
+    }
+  };
+}
+
+const MODE_INFO = {
+  Router: 'The main Deco connects to the internet and hands out IP addresses.',
+  AP: 'Your modem/router hands out IP addresses; the Decos only provide Wi-Fi.',
+};
+
+// Runs a request that goes through the Deco app's protocol, which signs in with the
+// TP-Link ID. Asks for it unless this session already signed in. Returns null if cancelled.
+async function withTpLinkId(mode, request) {
+  if (mode.verified) {
+    try {
+      toast('Connecting to the Deco…');
+      return await request({});
+    } catch (err) {
+      toast(err.message, true);
+      if (err.code !== 'auth') return null;
+    }
+  }
+  let out = null;
+  const ok = await openDialog(
+    `
+    <h3>Sign in with your TP-Link ID</h3>
+    <p class="muted">This uses the same local connection as the Deco app, which signs in with your TP-Link ID. Nothing goes over the internet.</p>
+    <label><span>Email</span><input name="email" type="email" required autocomplete="username" value="${esc(mode.email || '')}" /></label>
+    <label><span>Password</span><input name="password" type="password" autocomplete="current-password" placeholder="Leave blank to use your login password" /></label>
+    <div class="notice warn">The Deco locks this sign-in after repeated wrong attempts, so check the email before continuing.</div>
+    <div class="dialog-actions"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Continue</button></div>`,
+    async (fd) => {
+      out = await request({ email: fd.get('email').trim(), password: fd.get('password') });
+      mode.verified = true;
+      return true;
+    }
+  );
+  return ok ? out : null;
+}
+
+async function changeMode(mode) {
+  const checked = await withTpLinkId(mode, (creds) => api('POST', '/api/mode/check', creds));
+  if (checked) chooseMode(checked);
+}
+
+// Groups flattened WAN fields under their section headings.
+function internetRowsHtml(rows) {
+  if (!rows.length) return '<p class="muted" style="margin:12px 0 0">The Deco didn\'t report any settings.</p>';
+  const groups = new Map();
+  for (const r of rows) {
+    if (!groups.has(r.group)) groups.set(r.group, []);
+    groups.get(r.group).push(r);
+  }
+  return [...groups]
+    .map(
+      ([group, list]) => `${group ? `<div class="kv-group">${esc(group)}</div>` : ''}<dl class="kv">${list
+        .map((r) => `<dt>${esc(r.label)}</dt><dd${r.secret ? '' : ' class="mono"'}>${r.secret ? secret(r.value) : esc(r.value || '–')}</dd>`)
+        .join('')}</dl>`
+    )
+    .join('');
+}
+
+const WAN_TYPES = [
+  { type: 'pppoe', label: 'PPPoE', mtu: [576, 1492], mtuDefault: 1480 },
+  { type: 'dynamic_ip', label: 'Dynamic IP', mtu: [576, 1500], mtuDefault: 1500 },
+  { type: 'static_ip', label: 'Static IP', mtu: [576, 1500], mtuDefault: 1500 },
+];
+
+async function editInternet(mode, btn) {
+  btn.disabled = true;
+  let r;
+  try {
+    r = await withTpLinkId(mode, (creds) => api('POST', '/api/internet/app', creds));
+  } finally {
+    btn.disabled = false;
+  }
+  if (!r) return;
+  const cur = r.current;
+  const type0 = WAN_TYPES.some((t) => t.type === cur.type) ? cur.type : 'pppoe';
+  const field = (name, label, value, attrs = '') =>
+    `<label><span>${label}</span><input name="${name}" value="${esc(value || '')}" ${attrs} /></label>`;
+
+  const done = openDialog(
+    `
+    <h3>Edit internet connection</h3>
+    ${cur.editable ? '' : `<div class="notice">Your Deco currently uses ${esc(cur.label || 'another connection type')}, which Deco Local can't edit. You can switch to one of these types.</div>`}
+    <label><span>Connection type</span><select name="type">${WAN_TYPES.map(
+      (t) => `<option value="${t.type}" ${t.type === type0 ? 'selected' : ''}>${t.label}</option>`
+    ).join('')}</select></label>
+    <div data-for="pppoe">
+      ${field('username', 'Username', cur.username, 'required autocomplete="off" autocapitalize="off" spellcheck="false"')}
+      <label><span>Password</span><input name="password" type="password" autocomplete="new-password"
+        placeholder="${cur.type === 'pppoe' ? 'Leave blank to keep the current password' : 'From your ISP'}" ${cur.type === 'pppoe' ? '' : 'required'} /></label>
+    </div>
+    <div data-for="static_ip">
+      ${field('ip', 'IP address', cur.type === 'static_ip' ? cur.ip : '', 'required inputmode="decimal"')}
+      ${field('mask', 'Subnet mask', cur.type === 'static_ip' ? cur.mask : '255.255.255.0', 'required inputmode="decimal"')}
+      ${field('gateway', 'Default gateway', cur.type === 'static_ip' ? cur.gateway : '', 'required inputmode="decimal"')}
+    </div>
+    <label class="choice" data-for="pppoe dynamic_ip"><input type="checkbox" name="autoDns" ${cur.autoDns ? 'checked' : ''} />
+      <span>Get DNS servers automatically</span></label>
+    <div data-dns>
+      ${field('dns1', 'Primary DNS', cur.dns1, 'required inputmode="decimal"')}
+      ${field('dns2', 'Secondary DNS (optional)', cur.dns2, 'inputmode="decimal"')}
+    </div>
+    ${cur.supportMtu ? `<label><span>MTU</span><input name="mtu" type="number" required value="${esc(cur.mtu || 1480)}" /></label>` : ''}
+    <div class="notice warn">Saving reconnects your internet, which takes about a minute. If the details are wrong, the internet stays down until you fix them here; Deco Local works without internet.</div>
+    <div class="dialog-actions"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Save</button></div>`,
+    async (fd) => {
+      const body = { type: fd.get('type'), autoDns: fd.get('autoDns') === 'on' };
+      for (const k of ['username', 'password', 'ip', 'mask', 'gateway', 'dns1', 'dns2']) if (fd.has(k)) body[k] = fd.get(k);
+      if (fd.has('mtu')) body.mtu = Number(fd.get('mtu'));
+      const res = await api('POST', '/api/internet', body);
+      toast(`Saved. Your internet is reconnecting as ${WAN_TYPES.find((t) => t.type === res.current?.type)?.label || 'requested'}…`);
+      return true;
+    }
+  );
+
+  // Show only the fields for the chosen type. Hidden fields are disabled so they're
+  // neither validated nor sent.
+  const form = $('#dialog-form');
+  const sync = (typeChanged) => {
+    const type = form.elements.type.value;
+    const spec = WAN_TYPES.find((t) => t.type === type);
+    const autoDns = type !== 'static_ip' && form.elements.autoDns.checked;
+    const show = (el, on) => {
+      el.hidden = !on;
+      $$('input, select', el).forEach((i) => (i.disabled = !on));
+    };
+    $$('[data-for]', form).forEach((el) => show(el, el.dataset.for.split(' ').includes(type)));
+    show($('[data-dns]', form), !autoDns);
+    const mtu = form.elements.mtu;
+    if (mtu) {
+      mtu.min = spec.mtu[0];
+      mtu.max = spec.mtu[1];
+      if (typeChanged && (Number(mtu.value) > spec.mtu[1] || Number(mtu.value) < spec.mtu[0])) mtu.value = spec.mtuDefault;
+    }
+  };
+  form.elements.type.onchange = () => sync(true);
+  form.elements.autoDns.onchange = () => sync(false);
+  sync(false);
+  if (await done) go('more', { quiet: true });
+}
+
+async function showAppInternetView(mode, box, btn) {
+  btn.disabled = true;
+  try {
+    const r = await withTpLinkId(mode, (creds) => api('POST', '/api/internet/app', creds));
+    if (r) box.innerHTML = `<div class="kv-group" style="margin-top:16px">From the Deco app's protocol</div>${internetRowsHtml(r.rows)}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Step 2: pick the mode, with the consequences spelled out.
+async function chooseMode(state) {
+  const host = window.__host || 'its current address';
+  const options = state.options.filter((o) => o.mode !== state.mode);
+  if (!options.length) {
+    toast(`This Deco only offers ${state.label || state.mode} mode.`);
+    return;
+  }
+  let result = null;
+  const done = openDialog(
+    `
+    <h3>Change operation mode</h3>
+    <p class="muted" style="margin:0 0 10px">Currently <b>${esc(state.label || state.mode || 'unknown')}</b>.</p>
+    ${options
+      .map(
+        (o, i) => `<label class="choice"><input type="radio" name="mode" value="${esc(o.mode)}" ${i === 0 ? 'checked' : ''} />
+        <span><b>${esc(o.label)}</b><br><span class="muted">${esc(MODE_INFO[o.mode] || '')}</span></span></label>`
+      )
+      .join('')}
+    <div class="notice warn">
+      <b>Before you switch:</b>
+      <ul style="margin:6px 0 0;padding-left:18px">
+        <li>Every Deco restarts. Wi-Fi drops for a few minutes.</li>
+        <li data-for="AP">In Access Point mode the main Deco gets its address from your modem/router, so it won't be at <b>${esc(host)}</b> anymore. Find its new address in your modem/router's device list, then log in here again with it.</li>
+        <li data-for="Router">In Router mode the main Deco hands out addresses again. Put your modem/router in bridge mode if you want to avoid double NAT.</li>
+        <li>The command for this has been worked out from the Deco app but not yet confirmed on every model.</li>
+      </ul>
+    </div>
+    <label class="choice" style="margin-top:12px"><input type="checkbox" name="ack" required />
+      <span>I can reach my modem/router another way if this goes wrong.</span></label>
+    <div class="dialog-actions"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn danger" value="ok">Switch mode</button></div>`,
+    async (fd) => {
+      result = await api('POST', '/api/mode', { mode: fd.get('mode') });
+      return true;
+    }
+  );
+  // Show only the warning for the mode being picked.
+  const form = $('#dialog-form');
+  const showFor = () => {
+    const picked = (form.querySelector('input[name=mode]:checked') || {}).value;
+    $$('[data-for]', form).forEach((li) => (li.hidden = li.dataset.for !== picked));
+  };
+  $$('input[name=mode]', form).forEach((r) => (r.onchange = showFor));
+  showFor();
+  if (!(await done)) return;
+  if (result && result.changed) {
+    toast(
+      result.confirmed
+        ? `Switched to ${result.label}. The Decos are restarting…`
+        : `The Deco accepted ${result.label} mode and is restarting.`
+    );
+  } else if (result) {
+    toast(`Already in ${result.label} mode.`);
+  }
+  go('more', { quiet: true });
 }
 
 function buildMoreTools(p) {
@@ -708,6 +1115,7 @@ function showLogin(host) {
   $('#view').innerHTML = '';
   $('#view-actions').innerHTML = '';
   state.clients = null;
+  state.dhcp = null;
   $('#app').hidden = true;
   $('#login').hidden = false;
   if (host !== undefined) $('#login-host').value = host;

@@ -12,5 +12,8 @@
     "mock": "node tools/mock-deco.js",
     "test": "node --test test/"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "ssh2": "1.17.0"
+  }
 }

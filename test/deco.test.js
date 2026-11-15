@@ -241,7 +241,7 @@ describe('Deco Local HTTP API end to end', () => {
     assert.equal(body.performance.cpu, 0.12);
     assert.equal(body.main.name, 'Living Room');
     assert.equal(body.lan.ip, '192.168.68.1');
-    assert.equal(body.wan.dialType, 'dynamic_ip');
+    assert.equal(body.wan.dialType, 'pppoe');
   });
 
   test('decos are normalized with decoded names', async () => {
